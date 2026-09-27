@@ -1,10 +1,15 @@
 'use strict';
 
-require('dotenv').config();
+require('dotenv').config({ path: require('node:path').join(__dirname, '.env') });
 
 const { Telegraf, Markup } = require('telegraf');
 const nodemailer = require('nodemailer');
 const XLSX = require('xlsx');
+const { randomUUID } = require('node:crypto');
+const { buildMailOptions, getConfiguredSocialLinks } = require('./email');
+const { downloadTelegramFile, downloadTelegramImage } = require('./images');
+const socialLinks = getConfiguredSocialLinks();
+const errorCode = (error) => ['EAUTH', 'ECONNECTION', 'ETIMEDOUT', 'ESOCKET', 'EENVELOPE', 'EMESSAGE'].includes(error?.code) ? error.code : 'REQUEST_FAILED';
 
 const REQUIRED_ENV = [
   'BOT_TOKEN',
@@ -29,6 +34,8 @@ const MAX_DELAY_MS = 30_000;
 const STEPS = Object.freeze({
   WAITING_FOR_FILE: 'WAITING_FOR_FILE',
   WAITING_FOR_MESSAGE: 'WAITING_FOR_MESSAGE',
+  WAITING_FOR_IMAGE_CHOICE: 'WAITING_FOR_IMAGE_CHOICE',
+  WAITING_FOR_IMAGE: 'WAITING_FOR_IMAGE',
   WAITING_FOR_CONFIRMATION: 'WAITING_FOR_CONFIRMATION',
   QUEUED: 'QUEUED',
   SENDING: 'SENDING',
@@ -38,6 +45,9 @@ const bot = new Telegraf(process.env.BOT_TOKEN);
 
 const transporter = nodemailer.createTransport({
   service: 'gmail',
+  connectionTimeout: 15_000,
+  greetingTimeout: 15_000,
+  socketTimeout: 30_000,
 
   auth: {
     user: process.env.GMAIL_USER,
@@ -72,11 +82,21 @@ function createInitialState() {
     emails: [],
     message: '',
     sourceCount: 0,
+    image: null,
+    id: randomUUID(),
+    busy: false,
   };
 }
 
 
+function clearUserState(userId) {
+  const previous = userStates.get(userId);
+  if (previous) { previous.image = null; previous.emails = []; previous.message = ''; }
+  userStates.delete(userId);
+}
+
 function resetUser(userId) {
+  clearUserState(userId);
   const state = createInitialState();
 
   userStates.set(userId, state);
@@ -149,21 +169,6 @@ function extractEmailsFromWorkbook(buffer) {
 }
 
 
-async function downloadTelegramFile(ctx, fileId) {
-  const fileUrl = await ctx.telegram.getFileLink(fileId);
-
-  const response = await fetch(fileUrl.href);
-
-  if (!response.ok) {
-    throw new Error(
-      `Telegram file download failed with HTTP ${response.status}`,
-    );
-  }
-
-  const arrayBuffer = await response.arrayBuffer();
-
-  return Buffer.from(arrayBuffer);
-}
 
 
 async function safeEditStatus(
@@ -188,7 +193,7 @@ async function safeEditStatus(
     if (!errorMessage.includes('message is not modified')) {
       console.error(
         'Could not update Telegram status:',
-        error.message,
+        errorCode(error),
       );
     }
   }
@@ -199,8 +204,9 @@ async function sendBatch(
   ctx,
   userId,
   statusMessage,
+  state,
 ) {
-  const state = getUserState(userId);
+  if (userStates.get(userId) !== state || state.step !== STEPS.QUEUED) return;
 
   state.step = STEPS.SENDING;
 
@@ -221,37 +227,18 @@ async function sendBatch(
     const recipient = state.emails[index];
 
     try {
-      let fromValue = process.env.GMAIL_USER;
-
-      if (process.env.EMAIL_FROM_NAME) {
-        const safeFromName =
-          process.env.EMAIL_FROM_NAME.replace(
-            /["\\]/g,
-            '',
-          );
-
-        fromValue =
-          `"${safeFromName}" <${process.env.GMAIL_USER}>`;
-      }
-
-      await transporter.sendMail({
-        from: fromValue,
-        to: recipient,
-        subject:
-          process.env.EMAIL_SUBJECT || 'Message',
-        text: state.message,
-      });
-
+      // Send only to recipients who consented to receive these emails.
+      await transporter.sendMail(buildMailOptions(state, recipient, socialLinks));
       successful += 1;
     } catch (error) {
       failures.push({
         email: recipient,
-        reason: error.message,
+        reason: errorCode(error),
       });
 
       console.error(
-        `Failed to send to ${recipient}:`,
-        error.message,
+        'Recipient delivery failed:',
+        errorCode(error),
       );
     }
 
@@ -312,7 +299,7 @@ async function sendBatch(
     report,
   );
 
-  resetUser(userId);
+  clearUserState(userId);
 
   await ctx.reply(
     'Send another .xlsx file whenever you want to start a new batch.',
@@ -329,12 +316,22 @@ bot.use(async (ctx, next) => {
     return;
   }
 
+  if (!ctx.from) return;
+  const active = userStates.get(ctx.from.id);
+  if (active && active.chatId != null && active.chatId !== ctx.chat?.id) {
+    await ctx.reply('Continue your active batch in the chat where it was started.');
+    return;
+  }
   await next();
 });
 
 
 bot.start(async (ctx) => {
-  resetUser(ctx.from.id);
+  const current = userStates.get(ctx.from.id);
+  if (current && [STEPS.QUEUED, STEPS.SENDING].includes(current.step)) {
+    return ctx.reply('Your batch is queued or sending. Use /cancel while queued; wait for completion while sending.');
+  }
+  resetUser(ctx.from.id).chatId = ctx.chat.id;
 
   await ctx.reply(
     'Welcome. Upload an Excel (.xlsx) file containing email addresses.\n\n' +
@@ -354,7 +351,7 @@ bot.command('cancel', async (ctx) => {
     return;
   }
 
-  resetUser(ctx.from.id);
+  clearUserState(ctx.from.id);
 
   await ctx.reply(
     'Current batch cancelled. Upload a new .xlsx file to begin again.',
@@ -364,6 +361,9 @@ bot.command('cancel', async (ctx) => {
 
 bot.on('document', async (ctx) => {
   const state = getUserState(ctx.from.id);
+  state.chatId ??= ctx.chat.id;
+  if (state.step === STEPS.WAITING_FOR_IMAGE) return receiveImage(ctx);
+  if (state.busy) return ctx.reply('Please wait for the current file to finish downloading.');
 
   if (state.step !== STEPS.WAITING_FOR_FILE) {
     await ctx.reply(
@@ -386,6 +386,7 @@ bot.on('document', async (ctx) => {
     return;
   }
 
+  state.busy = true;
   try {
     await ctx.reply(
       'Reading the Excel file...',
@@ -396,6 +397,7 @@ bot.on('document', async (ctx) => {
       document.file_id,
     );
 
+    if (userStates.get(ctx.from.id) !== state) return;
     const allEmails =
       extractEmailsFromWorkbook(buffer);
 
@@ -437,13 +439,13 @@ bot.on('document', async (ctx) => {
   } catch (error) {
     console.error(
       'Excel processing error:',
-      error,
+      errorCode(error),
     );
 
     await ctx.reply(
       'I could not read that workbook. Make sure it is a valid .xlsx file and try again.',
     );
-  }
+  } finally { state.busy = false; }
 });
 
 
@@ -462,7 +464,7 @@ bot.on('text', async (ctx) => {
     STEPS.WAITING_FOR_MESSAGE
   ) {
     await ctx.reply(
-      'Please upload an .xlsx file first, or use /cancel to restart.',
+      state.step === STEPS.WAITING_FOR_IMAGE ? 'Please upload a PNG/JPEG photo or document, or use /cancel.' : 'Follow the current step using the buttons, or use /cancel to restart.',
     );
 
     return;
@@ -477,115 +479,95 @@ bot.on('text', async (ctx) => {
   }
 
   state.message = text;
-  state.step =
-    STEPS.WAITING_FOR_CONFIRMATION;
-
-  await ctx.reply(
-    `Ready to send to ${state.emails.length} recipient(s). Confirm?`,
-    Markup.inlineKeyboard([
-      Markup.button.callback(
-        'Yes',
-        'CONFIRM_SEND',
-      ),
-      Markup.button.callback(
-        'No',
-        'CANCEL_SEND',
-      ),
-    ]),
-  );
+  state.step = STEPS.WAITING_FOR_IMAGE_CHOICE;
+  await ctx.reply('Would you like to add an image/design?', keyboard(state, [['Add Image', 'ADD_IMAGE'], ['Skip Image', 'SKIP_IMAGE'], ['Cancel', 'CANCEL_SEND']]));
 });
 
+function keyboard(state, actions) {
+  return Markup.inlineKeyboard(actions.map(([label, action]) => Markup.button.callback(label, action + ':' + state.id)));
+}
 
-bot.action('CANCEL_SEND', async (ctx) => {
-  const state = getUserState(ctx.from.id);
+async function showConfirmation(ctx, state) {
+  state.step = STEPS.WAITING_FOR_CONFIRMATION;
+  await ctx.reply([
+    'Ready to send', '',
+    'Recipients: ' + state.emails.length,
+    'Subject: ' + (process.env.EMAIL_SUBJECT || 'Message'),
+    'Image: ' + (state.image ? 'Included' : 'Not included'),
+    'Social links: ' + (socialLinks.map((link) => link.name).join(', ') || 'None'),
+  ].join('\n'), keyboard(state, [['Send', 'CONFIRM_SEND'], ['Cancel', 'CANCEL_SEND']]));
+}
 
-  await ctx.answerCbQuery();
+async function receiveImage(ctx) {
+  const state = userStates.get(ctx.from.id);
+  if (!state || state.step !== STEPS.WAITING_FOR_IMAGE) return ctx.reply('Choose Add Image after entering your message first.');
+  if (state.busy) return ctx.reply('Please wait for the current image to finish downloading.');
+  state.busy = true;
+  try {
+    const image = await downloadTelegramImage(ctx);
+    if (userStates.get(ctx.from.id) !== state) return;
+    state.image = image;
+    await showConfirmation(ctx, state);
+  } catch (error) {
+    if (userStates.get(ctx.from.id) !== state) return;
+    state.image = null;
+    state.step = STEPS.WAITING_FOR_IMAGE;
+    const messages = { TOO_LARGE: 'Image exceeds the 5 MB limit. Upload a smaller image.', UNSUPPORTED_IMAGE: 'Unsupported image. Send a PNG or JPEG photo/document with a matching filename and MIME type.' };
+    await ctx.reply(messages[error.message] || 'Could not download the image. Please try again or use /cancel.');
+  } finally { state.busy = false; }
+}
 
-  if (
-    state.step !==
-    STEPS.WAITING_FOR_CONFIRMATION
-  ) {
-    await ctx.reply(
-      'This confirmation is no longer active.',
-    );
+bot.on('photo', receiveImage);
 
-    return;
+bot.on('callback_query', async (ctx) => {
+  const [action, id] = (ctx.callbackQuery.data || '').split(':');
+  const state = userStates.get(ctx.from.id);
+  const validSteps = {
+    ADD_IMAGE: [STEPS.WAITING_FOR_IMAGE_CHOICE],
+    SKIP_IMAGE: [STEPS.WAITING_FOR_IMAGE_CHOICE],
+    CANCEL_SEND: [STEPS.WAITING_FOR_IMAGE_CHOICE, STEPS.WAITING_FOR_IMAGE, STEPS.WAITING_FOR_CONFIRMATION],
+    CONFIRM_SEND: [STEPS.WAITING_FOR_CONFIRMATION],
+  };
+  if (!state || state.id !== id || !validSteps[action]?.includes(state.step) || state.busy) {
+    return ctx.answerCbQuery('This action is no longer active. Follow the current step or use /start.');
   }
-
-  resetUser(ctx.from.id);
-
-  await ctx.editMessageText(
-    'Batch cancelled. Upload a new .xlsx file to begin again.',
-  );
-});
-
-
-bot.action('CONFIRM_SEND', async (ctx) => {
-  const userId = ctx.from.id;
-
-  const state = getUserState(userId);
-
-  await ctx.answerCbQuery();
-
-  if (
-    state.step !==
-    STEPS.WAITING_FOR_CONFIRMATION
-  ) {
-    await ctx.reply(
-      'This confirmation is no longer active.',
-    );
-
-    return;
+  // Change state before any await, so double clicks cannot enqueue a second job.
+  if (action === 'CANCEL_SEND') {
+    clearUserState(ctx.from.id);
+    await ctx.answerCbQuery();
+    return ctx.editMessageText('Batch cancelled. Upload a new .xlsx file to begin again.');
   }
-
+  if (action === 'ADD_IMAGE') {
+    state.step = STEPS.WAITING_FOR_IMAGE;
+    await ctx.answerCbQuery();
+    return ctx.editMessageText('Upload a PNG or JPEG photo/document, up to 5 MB. Use /cancel to discard this batch.');
+  }
+  if (action === 'SKIP_IMAGE') {
+    state.step = STEPS.WAITING_FOR_CONFIRMATION;
+    await ctx.answerCbQuery();
+    return showConfirmation(ctx, state);
+  }
   state.step = STEPS.QUEUED;
-
-  await ctx.editMessageText(
-    'Confirmed. The batch has been added to the sending queue.',
-  );
-
-  const statusMessage = await ctx.reply(
-    'Waiting for the sender...',
-  );
-
- 
-  globalSendQueue = globalSendQueue
-    .catch((error) => {
-      console.error(
-        'Previous queue job failed:',
-        error,
-      );
-    })
-    .then(() => {
-      return sendBatch(
-        ctx,
-        userId,
-        statusMessage,
-      );
-    })
-    .catch(async (error) => {
-      console.error(
-        'Batch error:',
-        error,
-      );
-
-      resetUser(userId);
-
-      await safeEditStatus(
-        ctx,
-        ctx.chat.id,
-        statusMessage.message_id,
-        'The batch stopped because of an unexpected error. Check the server logs.',
-      );
-    });
+  await ctx.answerCbQuery();
+  await ctx.editMessageText('Confirmed. The batch has been added to the sending queue.');
+  const statusMessage = await ctx.reply('Waiting for the sender... Use /cancel before sending starts to cancel.');
+  const userId = ctx.from.id;
+  globalSendQueue = globalSendQueue.catch(() => {}).then(async () => {
+    try {
+      await sendBatch(ctx, userId, statusMessage, state);
+    } catch (error) {
+      console.error('Batch error:', errorCode(error));
+      if (userStates.get(userId) === state) clearUserState(userId);
+      await safeEditStatus(ctx, ctx.chat.id, statusMessage.message_id, 'The batch stopped because of an unexpected error. Start again with /start.');
+    }
+  });
 });
 
-
-bot.catch((error, ctx) => {
-  console.error(
-    `Unhandled bot error for update ${ctx.update.update_id}:`,
-    error,
-  );
+bot.catch(async (error, ctx) => {
+  console.error('Bot request failed:', errorCode(error));
+  const state = userStates.get(ctx.from?.id);
+  if (state?.step !== STEPS.SENDING) clearUserState(ctx.from?.id);
+  await ctx.reply('An unexpected error occurred. Use /start to restart, or wait if your batch is already sending.').catch(() => {});
 });
 
 
@@ -597,17 +579,13 @@ async function main() {
     'Gmail SMTP connection verified.',
   );
 
-  await bot.launch();
-
-  console.log(
-    'Telegram email bot is running.',
-  );
+  await bot.launch({}, () => console.log('Telegram email bot is running.'));
 }
 
-main().catch((error) => {
+if (require.main === module) main().catch((error) => {
   console.error(
     'Startup failed:',
-    error,
+    errorCode(error),
   );
 
   process.exitCode = 1;
@@ -615,7 +593,9 @@ main().catch((error) => {
 
 
 function shutdown(signal) {
-  bot.stop(signal);
+  try { bot.stop(signal); } catch {}
+  transporter.close();
+  for (const userId of userStates.keys()) clearUserState(userId);
 }
 
 process.once('SIGINT', () => {
@@ -625,3 +605,4 @@ process.once('SIGINT', () => {
 process.once('SIGTERM', () => {
   shutdown('SIGTERM');
 });
+module.exports = { bot, transporter, main, userStates, STEPS, clearUserState, extractEmailsFromWorkbook, sendBatch, randomDelayMs, getQueue: () => globalSendQueue };
