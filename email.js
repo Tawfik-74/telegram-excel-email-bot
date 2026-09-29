@@ -49,7 +49,7 @@ function buildMailOptions(state, recipient, socialLinks, env = process.env) {
   const options = {
     from: env.EMAIL_FROM_NAME ? { name: env.EMAIL_FROM_NAME.replace(/[\r\n]/g, ''), address: env.GMAIL_USER } : env.GMAIL_USER,
     to: recipient,
-    subject: env.EMAIL_SUBJECT || 'Message',
+    subject: state.subject || env.EMAIL_SUBJECT || 'Message',
     text: buildPlainTextEmail(content),
     html: buildEmailHtml(content),
   };

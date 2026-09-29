@@ -54,7 +54,11 @@ test('email bot regression and enhancement scenarios', async (t) => {
     await message({text:'/start'},user);
     bytes=workbook(count);
     await message({document:{file_id:'sheet',file_name:'list.xlsx'}},user);
+    assert.equal(app.userStates.get(user).step, app.STEPS.WAITING_FOR_SUBJECT);
+    assert.equal(calls.at(-1).reply_markup.input_field_placeholder,'Enter the email subject');
+    await message({text:'Custom campaign subject ' + user},user);
     assert.equal(app.userStates.get(user).step, app.STEPS.WAITING_FOR_MESSAGE);
+    assert.equal(calls.at(-1).reply_markup.input_field_placeholder,'Enter the email message');
     await message({text:'Hello <script>alert("x")</script> & friends\nSecond line'},user);
     assert.equal(app.userStates.get(user).step,app.STEPS.WAITING_FOR_IMAGE_CHOICE);
   }
@@ -66,6 +70,8 @@ test('email bot regression and enhancement scenarios', async (t) => {
       assert.equal(app.userStates.get(1).image,null);
       await action('CONFIRM_SEND'); await app.getQueue();
       assert.equal(sent.length,1); assert.equal(sent[0].to,'user0@example.com');
+      assert.equal(sent[0].subject,'Custom campaign subject 1');
+      assert.ok(!sent[0].text.includes('Custom campaign subject 1'));
       assert.equal(sent[0].attachments,undefined); assert.ok(!sent[0].html.includes('<img'));
       assert.ok(sent[0].html.includes('&lt;script&gt;')); assert.ok(sent[0].html.includes('<br>Second line'));
       assert.ok(sent[0].text.includes('<script>')); assert.ok(!app.userStates.has(1));
@@ -94,7 +100,7 @@ test('email bot regression and enhancement scenarios', async (t) => {
       const state=app.userStates.get(1), offset=sent.length;
       assert.equal(state.image.contentType,'image/jpeg');
       const summary=calls.filter(c=>c.method==='sendMessage').at(-1).text;
-      for(const value of ['Recipients: 1','Subject: Test subject','Image: Included','Social links: None']) assert.ok(summary.includes(value));
+      for(const value of ['Recipients: 1','Subject: Custom campaign subject 1','Message preview:','Hello <script>','Image: Included','Social links: None']) assert.ok(summary.includes(value));
       await Promise.all([action('CONFIRM_SEND',1,state.id),action('CONFIRM_SEND',1,state.id)]);
       await app.getQueue();assert.equal(sent.length-offset,1);assert.equal(state.image,null);
     });
@@ -164,6 +170,31 @@ test('email bot regression and enhancement scenarios', async (t) => {
       await message({text:'/start'},3);assert.ok(!app.userStates.has(3));
       assert.ok(calls.at(-1).text.includes('not authorized'));
       const state=app.userStates.get(1);await action('UNKNOWN');assert.equal(app.userStates.get(1),state);
+    });
+    await t.test('subject validation, cancellation and independent user subjects',async()=>{
+      await message({text:'/start'});bytes=workbook();
+      await message({document:{file_id:'sheet',file_name:'list.xlsx'}});
+      for(const invalid of ['   ','Title\nBody','Title\r\nBcc: other@example.com','x'.repeat(201),'Title\u0000']) {
+        await message({text:invalid});assert.equal(app.userStates.get(1).step,app.STEPS.WAITING_FOR_SUBJECT);
+        assert.equal(app.userStates.get(1).subject,'');
+      }
+      const old=app.userStates.get(1);await message({text:'/cancel'});assert.ok(!app.userStates.has(1));assert.equal(old.subject,'');
+      await prepare(1,1);await prepare(1,2);
+      assert.equal(app.userStates.get(1).subject,'Custom campaign subject 1');
+      assert.equal(app.userStates.get(2).subject,'Custom campaign subject 2');
+      await message({text:'/cancel'},2);
+      const first=app.userStates.get(1);await message({text:'/cancel'});assert.equal(first.subject,'');
+      await message({text:'/start'});bytes=workbook();await message({document:{file_id:'sheet',file_name:'list.xlsx'}});
+      const title='عنوان عربي ✨ ' + 'x'.repeat(180);
+      await message({text:title});assert.equal(app.userStates.get(1).subject,title);
+      await message({text:'   '});assert.equal(app.userStates.get(1).step,app.STEPS.WAITING_FOR_MESSAGE);
+      const body='First paragraph.\n\n'+'Long message '.repeat(200);
+      await message({text:body});await action('SKIP_IMAGE');
+      const preview=calls.filter(c=>c.method==='sendMessage').at(-1).text;
+      assert.ok(preview.includes('Message preview:'));assert.ok(preview.length<4096);assert.ok(preview.includes('…'));
+      const mail=email.buildMailOptions(app.userStates.get(1),'test@example.com',[]);
+      assert.equal(mail.subject,title);assert.ok(mail.text.startsWith(body.trim()));
+      await message({text:'/cancel'});
     });
     await t.test('startup verifies SMTP before launch; SMTP failure blocks launch',async()=>{
       const verify=app.transporter.verify,launch=app.bot.launch,order=[];

@@ -15,9 +15,9 @@ Run `npm run check`, `npm test`, then `npm start`. SMTP verification must succee
 ## Flow
 
 1. Send `/start`, then an `.xlsx` workbook. All sheets are scanned; valid addresses are deduplicated and limited to the first 100.
-2. Send a meaningful plain-text message. HTML entered here is escaped, never executed.
+2. Enter the **Subject** in its own reply field (one non-empty line, up to 200 characters). Then enter the **Message** in a separate reply field; paragraphs and line breaks are supported. The subject belongs to this batch and overrides `EMAIL_SUBJECT`. HTML entered in the message is escaped, never executed.
 3. Select **Add Image** or **Skip Image**. Photos and PNG/JPEG documents are supported, up to **5 MiB (5,242,880 bytes)**. Document extension, MIME type and file signature must agree. The largest photo variant is used.
-4. Review recipient count, subject, image status and enabled social platforms, then select **Send** or **Cancel**.
+4. Review recipient count, subject, a message preview, image status and enabled social platforms, then select **Send** or **Cancel**. The preview is shortened for long messages; the full message is emailed.
 5. Emails are sent individually through one queue, with randomized 15–30 second delays, progress every 10 recipients and a final success/failure report.
 
 Images are inline CID attachments held temporarily in memory. No uploaded image is saved to disk. Both HTML and text bodies include the message and branding; configured social URLs also appear in text. The HTML remains readable with images blocked. Tables, inline CSS and visible platform names support common email clients without external icon images.

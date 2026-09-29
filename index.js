@@ -33,6 +33,7 @@ const MAX_DELAY_MS = 30_000;
 
 const STEPS = Object.freeze({
   WAITING_FOR_FILE: 'WAITING_FOR_FILE',
+  WAITING_FOR_SUBJECT: 'WAITING_FOR_SUBJECT',
   WAITING_FOR_MESSAGE: 'WAITING_FOR_MESSAGE',
   WAITING_FOR_IMAGE_CHOICE: 'WAITING_FOR_IMAGE_CHOICE',
   WAITING_FOR_IMAGE: 'WAITING_FOR_IMAGE',
@@ -80,6 +81,7 @@ function createInitialState() {
   return {
     step: STEPS.WAITING_FOR_FILE,
     emails: [],
+    subject: '',
     message: '',
     sourceCount: 0,
     image: null,
@@ -91,7 +93,7 @@ function createInitialState() {
 
 function clearUserState(userId) {
   const previous = userStates.get(userId);
-  if (previous) { previous.image = null; previous.emails = []; previous.message = ''; }
+  if (previous) { previous.image = null; previous.emails = []; previous.subject = ''; previous.message = ''; }
   userStates.delete(userId);
 }
 
@@ -417,7 +419,7 @@ bot.on('document', async (ctx) => {
       MAX_EMAILS_PER_BATCH,
     );
 
-    state.step = STEPS.WAITING_FOR_MESSAGE;
+    state.step = STEPS.WAITING_FOR_SUBJECT;
 
     let limitNotice = '';
 
@@ -434,7 +436,8 @@ bot.on('document', async (ctx) => {
     await ctx.reply(
       `Found ${allEmails.length} valid unique email address(es).` +
         `${limitNotice}\n\n` +
-        'Now send the plain-text message that should be emailed.',
+        'Subject — Email title\nSend the subject only, on one line (up to 200 characters). Next, I will ask for the message separately.',
+      inputField('Enter the email subject'),
     );
   } catch (error) {
     console.error(
@@ -459,6 +462,19 @@ bot.on('text', async (ctx) => {
     return;
   }
 
+  if (state.step === STEPS.WAITING_FOR_SUBJECT) {
+    const rawSubject = ctx.message.text;
+    if (!text || /[\u0000-\u001f\u007f\u0085\u2028\u2029]/u.test(rawSubject) || [...text].length > 200) {
+      return ctx.reply('Subject must be a non-empty single line of up to 200 characters. Send only the title here.', inputField('Enter the email subject'));
+    }
+    state.subject = text;
+    state.step = STEPS.WAITING_FOR_MESSAGE;
+    return ctx.reply(
+      `Subject saved: ${state.subject}\n\nMessage — Email body\nNow send the message text only. You can use multiple lines and paragraphs.`,
+      inputField('Enter the email message'),
+    );
+  }
+
   if (
     state.step !==
     STEPS.WAITING_FOR_MESSAGE
@@ -472,7 +488,8 @@ bot.on('text', async (ctx) => {
 
   if (!text) {
     await ctx.reply(
-      'The email message cannot be empty. Please send plain text.',
+      'Message cannot be empty. Please send the email body.',
+      inputField('Enter the email message'),
     );
 
     return;
@@ -483,6 +500,10 @@ bot.on('text', async (ctx) => {
   await ctx.reply('Would you like to add an image/design?', keyboard(state, [['Add Image', 'ADD_IMAGE'], ['Skip Image', 'SKIP_IMAGE'], ['Cancel', 'CANCEL_SEND']]));
 });
 
+function inputField(placeholder) {
+  return { reply_markup: { force_reply: true, selective: true, input_field_placeholder: placeholder } };
+}
+
 function keyboard(state, actions) {
   return Markup.inlineKeyboard(actions.map(([label, action]) => Markup.button.callback(label, action + ':' + state.id)));
 }
@@ -492,7 +513,11 @@ async function showConfirmation(ctx, state) {
   await ctx.reply([
     'Ready to send', '',
     'Recipients: ' + state.emails.length,
-    'Subject: ' + (process.env.EMAIL_SUBJECT || 'Message'),
+    'Subject: ' + state.subject,
+    '',
+    'Message preview:',
+    state.message.length > 600 ? state.message.slice(0, 600) + '…' : state.message,
+    '',
     'Image: ' + (state.image ? 'Included' : 'Not included'),
     'Social links: ' + (socialLinks.map((link) => link.name).join(', ') || 'None'),
   ].join('\n'), keyboard(state, [['Send', 'CONFIRM_SEND'], ['Cancel', 'CANCEL_SEND']]));
