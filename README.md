@@ -4,6 +4,13 @@ Node.js 18+ bot using Telegraf, Nodemailer, XLSX and dotenv. Existing Gmail SMTP
 
 ## Setup
 
+Clone the repository before setup:
+
+```bash
+git clone https://github.com/Tawfik-74/telegram-excel-email-bot.git
+cd telegram-excel-email-bot
+```
+
 Run `npm ci`. On a new installation only, create `.env` from `.env.example` and fill in credentials locally. Never commit `.env`. Existing installations should retain their current `.env`.
 
 Required: `BOT_TOKEN`, `GMAIL_USER`, `GMAIL_APP_PASSWORD` (a Gmail App Password). Optional: `EMAIL_FROM_NAME`, `EMAIL_SUBJECT`, and comma-separated `ALLOWED_TELEGRAM_USER_IDS`. An empty allowlist preserves the original behavior: anyone can use the bot, so configure it for a private deployment.
@@ -11,6 +18,8 @@ Required: `BOT_TOKEN`, `GMAIL_USER`, `GMAIL_APP_PASSWORD` (a Gmail App Password)
 Optional social settings: `INSTAGRAM_URL`, `FACEBOOK_URL`, `LINKEDIN_URL`, `X_URL`, `WEBSITE_URL`. Only valid direct HTTPS URLs appear in the email and confirmation; empty entries are hidden. Invalid entries produce a warning naming the variable only. Known shorteners and common tracking parameters are rejected; use direct destination links without tracking. No extra dependencies are required.
 
 Run `npm run check`, `npm test`, then `npm start`. SMTP verification must succeed before Telegram polling starts. TLS certificate validation remains enabled; resolve certificate trust issues in the host environment.
+
+On Windows PowerShell, use `npm.cmd` instead of `npm` if script execution policy blocks it, for example `npm.cmd start`.
 
 ## Flow
 
@@ -33,3 +42,7 @@ Send only to recipients who consented. For marketing mail, provide and honor an 
 `npm test` uses simulated Telegram/SMTP requests and exercises the flows, image validation, cancellation, stale buttons, HTML escaping, recipient isolation, failures, progress, pacing and startup. It sends no real emails and does not use real credentials.
 
 Before a larger batch, use a workbook with one controlled recipient and verify in Gmail: the image appears inline, text remains readable with images blocked, social buttons open the configured destinations, and **Show original** includes both text/plain and text/html plus the matching Content-ID. Test both photo upload and PNG/JPEG document upload through Telegram. Check mobile rendering and repeat with Skip Image. Live Gmail display requires manual verification; automated MIME checks cannot confirm it.
+
+## Author
+
+Developed by [Tawfik-74](https://github.com/Tawfik-74).
